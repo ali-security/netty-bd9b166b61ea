@@ -29,6 +29,7 @@ import io.netty.channel.nio.NioEventLoopGroup;
 import io.netty.channel.socket.nio.NioServerSocketChannel;
 import io.netty.channel.socket.nio.NioSocketChannel;
 import io.netty.handler.codec.compression.Brotli;
+import io.netty.handler.codec.compression.DecompressionException;
 import io.netty.handler.codec.http.HttpHeaderNames;
 import io.netty.handler.codec.http.HttpHeaderValues;
 import io.netty.handler.codec.http2.Http2TestUtil.Http2Runnable;
@@ -58,6 +59,7 @@ import static io.netty.handler.codec.http2.Http2TestUtil.runInChannel;
 import static java.util.concurrent.TimeUnit.MILLISECONDS;
 import static java.util.concurrent.TimeUnit.SECONDS;
 import static org.junit.jupiter.api.Assertions.assertEquals;
+import static org.junit.jupiter.api.Assertions.assertNotNull;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 import static org.mockito.Mockito.any;
 import static org.mockito.Mockito.anyBoolean;
@@ -74,6 +76,11 @@ public class DataCompressionHttp2Test {
     private static final AsciiString GET = new AsciiString("GET");
     private static final AsciiString POST = new AsciiString("POST");
     private static final AsciiString PATH = new AsciiString("/some/path");
+    /**
+     * Size of the decompression bomb used by the CVE-2026-42587 regression tests: zero-filled input compresses to
+     * next to nothing but expands to 512 KiB, which is far beyond the {@code maxAllocation} they configure.
+     */
+    private static final int BOMB_SIZE = 512 * 1024;
 
     @Mock
     private Http2FrameListener serverListener;
@@ -105,7 +112,7 @@ public class DataCompressionHttp2Test {
             @Override
             public Void answer(InvocationOnMock invocation) throws Throwable {
                 if (invocation.getArgument(4)) {
-                    serverConnection.stream((Integer) invocation.getArgument(1)).close();
+                    closeServerStream((Integer) invocation.getArgument(1));
                 }
                 return null;
             }
@@ -115,7 +122,7 @@ public class DataCompressionHttp2Test {
             @Override
             public Void answer(InvocationOnMock invocation) throws Throwable {
                 if (invocation.getArgument(7)) {
-                    serverConnection.stream((Integer) invocation.getArgument(1)).close();
+                    closeServerStream((Integer) invocation.getArgument(1));
                 }
                 return null;
             }
@@ -299,6 +306,67 @@ public class DataCompressionHttp2Test {
         }
     }
 
+    /**
+     * Regression test for CVE-2026-42587: a highly compressible body that decompresses far beyond the configured
+     * maxAllocation must not be delivered in full. The limit used to be disregarded for {@code br}, {@code zstd}
+     * and {@code snappy}, so every supported content-encoding is verified here. The bound is enforced inside
+     * DelegatingDecompressorFrameListener itself, so it does not depend on a patched netty-codec.
+     */
+    @ParameterizedTest
+    @ValueSource(strings = { "gzip", "deflate", "br", "zstd", "snappy" })
+    public void decompressionBoundedByMaxAllocation(final String contentEncoding) throws Exception {
+        final int maxAllocation = 64 * 1024;
+        final byte[] uncompressed = new byte[BOMB_SIZE]; // zero-filled: compresses tiny, expands to 512 KiB
+        final ByteBuf data = Unpooled.wrappedBuffer(uncompressed);
+        bootstrapEnv(maxAllocation, maxAllocation);
+        try {
+            writeBomb(contentEncoding, data);
+            // The stream is expected to be failed once the bound is crossed, so awaitServer() can not be used
+            // here: it rethrows any server side error.
+            assertTrue(serverLatch.await(5, SECONDS));
+            serverOut.flush();
+
+            Throwable cause = serverException.get();
+            assertNotNull(cause, "the stream must be failed once maxAllocation is exceeded for " + contentEncoding);
+            Throwable decompressionFailure = cause;
+            while (decompressionFailure != null && !(decompressionFailure instanceof DecompressionException)) {
+                decompressionFailure = decompressionFailure.getCause();
+            }
+            assertNotNull(decompressionFailure, "expected a DecompressionException but got: " + cause);
+            assertTrue(decompressionFailure.getMessage().contains("maximum size"),
+                    "unexpected decompression failure: " + decompressionFailure.getMessage());
+
+            // Without the bound the full 512 KiB would reach the listener; with it the decompression is aborted
+            // once maxAllocation is crossed, so the delivered output stays bounded well below the bomb size.
+            assertTrue(serverOut.size() <= maxAllocation,
+                    "decompressed output " + serverOut.size() + " must be bounded by maxAllocation " + maxAllocation);
+            assertTrue(serverOut.size() < BOMB_SIZE,
+                    "decompressed output " + serverOut.size() + " must be smaller than bomb size " + BOMB_SIZE);
+        } finally {
+            data.release();
+        }
+    }
+
+    /**
+     * Control for CVE-2026-42587: with the default maxAllocation of 0 (no limit, unchanged behaviour) the very same
+     * payload is decompressed and delivered in full. This proves the bounded variants above really do exercise the
+     * decompression bomb for every content-encoding rather than being blocked by something else in the harness.
+     */
+    @ParameterizedTest
+    @ValueSource(strings = { "gzip", "deflate", "br", "zstd", "snappy" })
+    public void decompressionUnboundedWhenMaxAllocationIsZero(final String contentEncoding) throws Exception {
+        final byte[] uncompressed = new byte[BOMB_SIZE]; // zero-filled: compresses tiny, expands to 512 KiB
+        final ByteBuf data = Unpooled.wrappedBuffer(uncompressed);
+        bootstrapEnv(BOMB_SIZE, 0);
+        try {
+            writeBomb(contentEncoding, data);
+            awaitServer();
+            assertEquals(BOMB_SIZE, serverOut.size());
+        } finally {
+            data.release();
+        }
+    }
+
     @ParameterizedTest
     @ValueSource(ints = { 0, 10 })
     public void zstdEncodingSingleEmptyMessage(final int padding) throws Exception {
@@ -428,6 +496,10 @@ public class DataCompressionHttp2Test {
     }
 
     private void bootstrapEnv(int serverOutSize) throws Exception {
+        bootstrapEnv(serverOutSize, 0);
+    }
+
+    private void bootstrapEnv(int serverOutSize, final int maxAllocation) throws Exception {
         final CountDownLatch prefaceWrittenLatch = new CountDownLatch(1);
         serverOut = new ByteArrayOutputStream(serverOutSize);
         serverLatch = new CountDownLatch(1);
@@ -456,7 +528,7 @@ public class DataCompressionHttp2Test {
                 buf.readBytes(serverOut, buf.readableBytes());
 
                 if (in.getArgument(4)) {
-                    serverConnection.stream((Integer) in.getArgument(1)).close();
+                    closeServerStream((Integer) in.getArgument(1));
                 }
                 return processedBytes;
             }
@@ -481,7 +553,8 @@ public class DataCompressionHttp2Test {
                 Http2ConnectionDecoder decoder =
                         new DefaultHttp2ConnectionDecoder(serverConnection, encoder, new DefaultHttp2FrameReader());
                 Http2ConnectionHandler connectionHandler = new Http2ConnectionHandlerBuilder()
-                        .frameListener(new DelegatingDecompressorFrameListener(serverConnection, serverListener) {
+                        .frameListener(new DelegatingDecompressorFrameListener(
+                                serverConnection, serverListener, true, maxAllocation) {
                             @Override
                             public int onDataRead(ChannelHandlerContext ctx, int streamId, ByteBuf data,
                                                   int padding, boolean endOfStream) throws Http2Exception {
@@ -544,6 +617,15 @@ public class DataCompressionHttp2Test {
         assertTrue(serverChannelLatch.await(5, SECONDS));
     }
 
+    private void closeServerStream(int streamId) {
+        // The stream may already have been removed, e.g. when it was failed because the decompressed content
+        // exceeded maxAllocation and the end-of-stream is only signalled while the decompressor is cleaned up.
+        final Http2Stream stream = serverConnection.stream(streamId);
+        if (stream != null) {
+            stream.close();
+        }
+    }
+
     private void awaitServer() throws Exception {
         assertTrue(serverLatch.await(5, SECONDS));
         serverOut.flush();
@@ -559,5 +641,19 @@ public class DataCompressionHttp2Test {
 
     private ChannelPromise newPromiseClient() {
         return ctxClient().newPromise();
+    }
+
+    private void writeBomb(CharSequence contentEncoding, final ByteBuf data) {
+        final Http2Headers headers = new DefaultHttp2Headers().method(POST).path(PATH)
+                .set(HttpHeaderNames.CONTENT_ENCODING, contentEncoding);
+
+        runInChannel(clientChannel, new Http2Runnable() {
+            @Override
+            public void run() throws Http2Exception {
+                clientEncoder.writeHeaders(ctxClient(), 3, headers, 0, false, newPromiseClient());
+                clientEncoder.writeData(ctxClient(), 3, data.retain(), 0, true, newPromiseClient());
+                clientHandler.flush(ctxClient());
+            }
+        });
     }
 }
