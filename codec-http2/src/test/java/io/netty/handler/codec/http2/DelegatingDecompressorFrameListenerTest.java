@@ -32,6 +32,7 @@ import org.junit.jupiter.params.ParameterizedTest;
 import org.junit.jupiter.params.provider.ValueSource;
 import org.mockito.ArgumentCaptor;
 
+import java.nio.channels.ClosedChannelException;
 import java.util.ArrayList;
 import java.util.List;
 
@@ -40,9 +41,11 @@ import static org.junit.jupiter.api.Assertions.assertFalse;
 import static org.junit.jupiter.api.Assertions.assertSame;
 import static org.junit.jupiter.api.Assertions.assertThrows;
 import static org.junit.jupiter.api.Assertions.assertTrue;
+import static org.junit.jupiter.api.Assertions.fail;
 import static org.mockito.ArgumentMatchers.eq;
 import static org.mockito.Mockito.atLeastOnce;
 import static org.mockito.Mockito.mock;
+import static org.mockito.Mockito.spy;
 import static org.mockito.Mockito.verify;
 
 public class DelegatingDecompressorFrameListenerTest {
@@ -174,6 +177,90 @@ public class DelegatingDecompressorFrameListenerTest {
         }
         assertFalse(allocator.allocated.isEmpty());
         assertEquals(0, allocator.liveBuffers());
+    }
+
+    /**
+     * Regression test for CVE-2026-56819. The per-stream decompressor {@link EmbeddedChannel} is closed as soon as
+     * a {@code DATA} frame with {@code endOfStream} was processed, but it stays attached to the stream. Writing into
+     * a closed {@link EmbeddedChannel} only fails <em>after</em> the passed in buffer was retained and the channel
+     * will not release it in that case, so a remote peer was able to leak one reference of the received (direct)
+     * buffer per {@code DATA} frame and so exhaust the memory of the JVM.
+     */
+    @Test
+    public void dataFramesAfterEndOfStreamDoNotLeak() throws Exception {
+        DelegatingDecompressorFrameListener listener =
+                new DelegatingDecompressorFrameListener(connection, new Http2FrameAdapter());
+        listener.onHeadersRead(ctx, STREAM_ID, gzipHeaders(), 0, false);
+
+        // Finishes (closes) the decompressor while it is still attached to the stream.
+        ByteBuf endOfStreamData = Unpooled.buffer();
+        try {
+            listener.onDataRead(ctx, STREAM_ID, endOfStreamData, 0, true);
+        } finally {
+            if (endOfStreamData.refCnt() > 0) {
+                endOfStreamData.release();
+            }
+        }
+
+        assertDataFramesForClosedDecompressorDoNotLeak(listener);
+    }
+
+    /**
+     * Regression test for CVE-2026-56819. Same as {@link #dataFramesAfterEndOfStreamDoNotLeak()}, but the
+     * decompressor is closed by the {@code onStreamRemoved -> Http2Decompressor.cleanup()} path (which calls
+     * {@link EmbeddedChannel#finishAndReleaseAll()}) while {@code DATA} frames for the stream still reach it.
+     */
+    @Test
+    public void dataFramesAfterDecompressorCleanupDoNotLeak() throws Exception {
+        Http2Connection spiedConnection = spy(connection);
+        DelegatingDecompressorFrameListener listener =
+                new DelegatingDecompressorFrameListener(spiedConnection, new Http2FrameAdapter());
+        ArgumentCaptor<Http2Connection.Listener> connectionListener =
+                ArgumentCaptor.forClass(Http2Connection.Listener.class);
+        verify(spiedConnection).addListener(connectionListener.capture());
+        listener.onHeadersRead(ctx, STREAM_ID, gzipHeaders(), 0, false);
+
+        // A first (empty) DATA frame binds the stream to the decompressor.
+        ByteBuf firstData = Unpooled.buffer();
+        try {
+            assertEquals(0, listener.onDataRead(ctx, STREAM_ID, firstData, 0, false));
+        } finally {
+            if (firstData.refCnt() > 0) {
+                firstData.release();
+            }
+        }
+
+        // Closes the decompressor via cleanup() while it is still attached to the stream.
+        connectionListener.getValue().onStreamRemoved(connection.stream(STREAM_ID));
+
+        assertDataFramesForClosedDecompressorDoNotLeak(listener);
+    }
+
+    private void assertDataFramesForClosedDecompressorDoNotLeak(DelegatingDecompressorFrameListener listener)
+            throws Exception {
+        // Replay the same direct buffer as if it were received via a flood of DATA frames for the stream whose
+        // decompressor is already closed. Each of them must fail the stream without taking ownership of the
+        // buffer, so its reference count must not grow. Without the fix it climbs by one for every frame.
+        ByteBuf data = Unpooled.directBuffer().writeZero(16);
+        try {
+            for (int i = 0; i < 8; i++) {
+                try {
+                    listener.onDataRead(ctx, STREAM_ID, data, 0, false);
+                    fail("DATA frame " + i + " for a closed decompressor must fail the stream");
+                } catch (Http2Exception.StreamException e) {
+                    assertEquals(STREAM_ID, e.streamId());
+                    assertEquals(Http2Error.INTERNAL_ERROR, e.error());
+                    assertTrue(e.getCause() instanceof ClosedChannelException, String.valueOf(e.getCause()));
+                }
+                assertEquals(1, data.refCnt(), "buffer was retained by DATA frame " + i + " and never released");
+            }
+        } finally {
+            data.release();
+        }
+    }
+
+    private static Http2Headers gzipHeaders() {
+        return new DefaultHttp2Headers().set(HttpHeaderNames.CONTENT_ENCODING, HttpHeaderValues.GZIP);
     }
 
     private static Http2Headers snappyHeaders() {
